@@ -11,8 +11,8 @@ working example over a complete product. Follow the scope and milestones in
 - Keep all agent implementation in `pieni.py`, with a Bash launcher named `pieni`.
   The launcher runs `.venv/bin/python` when it exists, else `python3`, and follows
   symlinks so an installed command still finds its own files.
-- Use the Python standard library and only two direct external dependencies:
-  `openai` and `openrouter`, listed in `requirements.txt`.
+- Use the Python standard library and only three direct external dependencies:
+  `openai`, `openrouter`, and `rich` (terminal UI only), listed in `requirements.txt`.
 - Use `openai` for OpenAI Responses and DeepSeek/custom Chat Completions;
   use the `openrouter` SDK for OpenRouter. Keep provider handling thin.
 - Use `configparser` for INI settings: user file first, launch-directory file

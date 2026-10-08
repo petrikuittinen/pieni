@@ -25,6 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import readline  # noqa: F401  Up/Down prompt history in input(), where available
+except ImportError:  # Windows consoles provide their own history
+    pass
+
 # --- Constants -------------------------------------------------------------
 
 APP_DIR = ".pieni"
@@ -391,6 +396,54 @@ def format_tool_call(name, arguments, ok, detail, milliseconds):
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# Status lines are colored by how they start; tool result lines by how they end.
+LINE_STYLES = (("error", "red"), ("denied", "red"), ("compaction failed", "red"),
+               ("interrupted", "yellow"), ("warning", "yellow"), ("Pieni agent", "bold cyan"),
+               ("permissions:", "cyan"), ("new session", "cyan"), ("resumed", "cyan"),
+               ("thinking:", "dim italic"), ("Tokens:", "dim"))
+
+
+def line_style(line):
+    if re.search(r" -> ok, \d+ ms$", line):
+        return "green"
+    if re.search(r" -> error.*, \d+ ms$", line):
+        return "red"
+    return next((style for key, style in LINE_STYLES if line.startswith(key)), None)
+
+
+class RichUI:
+    """Terminal output with Rich: model text is Markdown, everything else is plain text."""
+
+    def __init__(self):
+        self.console = load_sdk("rich.console", "Console")()
+        self._live = load_sdk("rich.live", "Live")
+        self._markdown = load_sdk("rich.markdown", "Markdown")
+        self.live = None
+        self.text = ""
+
+    def out(self, line):
+        """A status or tool line: never parsed as markup or Markdown."""
+        self.console.print(line, style=line_style(line), markup=False, highlight=False)
+
+    def markdown(self, text):
+        self.console.print(self._markdown(text))
+
+    def stream(self, text):
+        """Re-render the reply as Markdown while it arrives."""
+        if self.live is None:
+            self.text = ""
+            self.live = self._live(console=self.console)
+            self.live.start()
+        self.text += text
+        self.live.update(self._markdown(self.text))
+
+    def end(self):
+        """Stop the live view (it prints the full reply); safe to call when idle."""
+        if self.live is not None:
+            live, self.live = self.live, None
+            live.stop()
 
 
 # --- Permissions -----------------------------------------------------------
@@ -1116,7 +1169,8 @@ class Agent:
     """The loop: send context to the model, run requested tools, repeat."""
 
     def __init__(self, provider, store, session_id, instructions, messages,
-                 workspace, permissions, out=print, dots=None, stream_out=None):
+                 workspace, permissions, out=print, dots=None, stream_out=None,
+                 answer_out=None, end_stream=None):
         self.provider = provider
         self.store = store
         self.session_id = session_id
@@ -1128,6 +1182,8 @@ class Agent:
         self.out = out
         self.stream_out = stream_out or (lambda text: print(text, end="", flush=True)
                                         if out is print else out(text))
+        self.answer_out = answer_out or out  # where a non-streamed model answer goes
+        self.end_stream = end_stream or (lambda: None)  # lets a UI close its live view
         self._streamed_text = False
         # None means "decide from the output stream itself"; tests pass a writer.
         self.dots = dot_writer() if dots is None else dots
@@ -1176,6 +1232,7 @@ class Agent:
         finally:
             if self._streamed_text:
                 self.stream_out("\n")
+            self.end_stream()
         trace = thinking_line(reply.thinking)
         if trace:
             self.out(trace)
@@ -1208,7 +1265,7 @@ class Agent:
             self.remember(assistant_message(reply))
             if not reply.tool_calls:
                 if not self._streamed_text:
-                    self.out(reply.text.strip() or "(the model returned no text)")
+                    self.answer_out(reply.text.strip() or "(the model returned no text)")
                 return True
             self.run_tools(reply.tool_calls)
         # The budget is spent: stop rather than loop forever. The context is kept,
@@ -1455,17 +1512,21 @@ def run_agent(arguments):
         else:
             session_line = (f"resumed a session with {len(messages)} message(s) "
                             f"({provider.name}/{provider.model})")
+        ui = RichUI() if arguments.run is None and sys.stdout.isatty() else None
+        say = ui.out if ui else print
         if arguments.run is None:
-            print(BANNER)  # greet an interactive session, once the start has worked
-        print(session_line)
+            say(BANNER)  # greet an interactive session, once the start has worked
+        say(session_line)
         permissions = Permissions(
             settings["permissions"], workspace,
             approve=None if arguments.run is not None else cli_approve)
-        print(f"permissions: {permissions.mode}")
+        say(f"permissions: {permissions.mode}")
         if permissions.mode == "yolo":
-            print(YOLO_WARNING)
+            say(YOLO_WARNING)
+        hooks = ({"out": ui.out, "answer_out": ui.markdown, "stream_out": ui.stream,
+                  "end_stream": ui.end} if ui else {})
         agent = Agent(provider, store, session_id, build_instructions(workspace),
-                      messages, workspace, permissions)
+                      messages, workspace, permissions, **hooks)
         if arguments.run is not None:
             if not arguments.run.strip():
                 raise ConfigError("-r/--run needs a non-empty prompt")

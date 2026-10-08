@@ -28,7 +28,7 @@ class FakePython:
     PRESENT = """#!/usr/bin/env bash
 case "$*" in
     *sys.version.split*) printf '3.12.9\\n' ;;
-    *"import openai, openrouter"*) exit 0 ;;
+    *"import openai, openrouter, rich"*) exit 0 ;;
 esac
 exit 0
 """
@@ -36,7 +36,7 @@ exit 0
     BROKEN = """#!/usr/bin/env bash
 case "$*" in
     *sys.version.split*) printf '3.12.9\\n' ;;
-    *"import openai, openrouter"*) exit 1 ;;
+    *"import openai, openrouter, rich"*) exit 1 ;;
 esac
 exit 0
 """
@@ -45,13 +45,13 @@ exit 0
     MAKES_VENV = """#!/usr/bin/env bash
 case "$*" in
     *sys.version.split*) printf '3.12.9\\n' ;;
-    *"import openai, openrouter"*) exit 1 ;;
+    *"import openai, openrouter, rich"*) exit 1 ;;
     "-m venv "*)
         mkdir -p "$3/bin"
         cat > "$3/bin/python" <<'INNER'
 #!/usr/bin/env bash
 case "$*" in
-    *"import openai, openrouter"*) exit 1 ;;
+    *"import openai, openrouter, rich"*) exit 1 ;;
 esac
 exit 0
 INNER
@@ -246,7 +246,7 @@ class InstallScriptTests(unittest.TestCase):
         bin_dir, stub = self.stub_python(FakePython.MAKES_VENV)
         completed = self.install(environment={"PYTHON": str(stub)}, path=bin_dir)
         self.assertNotEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("missing; installing openai and openrouter", completed.stdout)
+        self.assertIn("missing; installing openai, openrouter and rich", completed.stdout)
         self.assertIn("dependencies are still missing", completed.stderr)
         self.assertIn("pip install -r", completed.stderr)
 

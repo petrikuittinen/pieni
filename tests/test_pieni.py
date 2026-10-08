@@ -2053,6 +2053,51 @@ class PromptCliTests(TempWorkspaceCase):
         self.assertFalse((self.workspace / ".pieni").exists())
 
 
+class RichUITests(unittest.TestCase):
+    def make_ui(self):
+        ui = pieni.RichUI()
+        ui.console = ui.console.__class__(file=StringIO(), force_terminal=False, width=60)
+        return ui
+
+    def test_status_lines_are_plain_text_and_replies_are_markdown(self):
+        ui = self.make_ui()
+        ui.out("[bold]**not markdown**[/bold]")
+        ui.markdown("**bold** text")
+        shown = ui.console.file.getvalue()
+        self.assertIn("[bold]**not markdown**[/bold]", shown)
+        self.assertIn("bold text", shown)
+        self.assertNotIn("**bold**", shown)
+
+    def test_streamed_text_is_rendered_once_and_end_is_idempotent(self):
+        ui = self.make_ui()
+        ui.stream("# Ti")
+        ui.stream("tle\n")
+        ui.end()
+        ui.end()
+        self.assertIsNone(ui.live)
+        self.assertEqual(ui.console.file.getvalue().count("Title"), 1)
+
+    def test_line_styles(self):
+        self.assertEqual(pieni.line_style("read(path='a') -> ok, 3 ms"), "green")
+        self.assertEqual(pieni.line_style("bash(command='x') -> error: exit code 1, 3 ms"), "red")
+        self.assertEqual(pieni.line_style("error: boom"), "red")
+        self.assertIsNone(pieni.line_style("plain output"))
+
+    def test_agent_hooks_route_model_text_to_markdown(self):
+        ui = self.make_ui()
+        provider = ScriptedProvider([reply_from(text="**done**")])
+        store = pieni.Store(":memory:")
+        self.addCleanup(store.close)
+        agent = pieni.Agent(provider, store, store.start_session("p", "m", "w"), "i", [],
+                            Path.cwd(), pieni.Permissions("auto", Path.cwd()),
+                            out=ui.out, answer_out=ui.markdown)
+        self.assertTrue(agent.run_task("go"))
+        shown = ui.console.file.getvalue()
+        self.assertIn("done", shown)
+        self.assertNotIn("**done**", shown)
+        self.assertIn("Tokens:", shown)
+
+
 class LauncherTests(unittest.TestCase):
     """The Bash launcher runs pieni.py, preferring the project virtualenv."""
 

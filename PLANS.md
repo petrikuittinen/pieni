@@ -127,7 +127,10 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 
 ### Interaction and history
 
-- Start with a plain terminal prompt, not a full TUI. Print the full final answer.
+- Start with a plain terminal prompt, not a full TUI. On an interactive terminal,
+  `rich` renders model replies as Markdown (live while streaming) and colors status
+  lines; other text is never Markdown. Up/Down recall earlier prompts via `readline`
+  where available. Piped output stays plain. Print the full final answer.
   Never invent or summarize reasoning: show only the thinking text the model itself
   returns, and skip the line when there is none.
 - Stream reply text by default, without printing the completed answer twice.

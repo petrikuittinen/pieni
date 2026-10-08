@@ -3,7 +3,7 @@
 # Install pieni on Ubuntu Linux.
 #
 # It checks the launcher in this checkout, makes sure the Python dependencies
-# (openai, openrouter) are importable, and puts a `pieni` command into
+# (openai, openrouter, rich) are importable, and puts a `pieni` command into
 # ~/.local/bin as a symlink to this checkout's launcher. No sudo is needed.
 #
 #   scripts/install.sh                  install into ~/.local/bin
@@ -124,7 +124,7 @@ if [ "$skip_deps" -eq 0 ]; then
     deps_python=""
     for candidate in "$repo/.venv/bin/python" "$(command -v "$python" 2>/dev/null || true)"; do
         [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-        if "$candidate" -c 'import openai, openrouter' >/dev/null 2>&1; then
+        if "$candidate" -c 'import openai, openrouter, rich' >/dev/null 2>&1; then
             deps_python="$candidate"
             break
         fi
@@ -134,7 +134,7 @@ if [ "$skip_deps" -eq 0 ]; then
         say "deps:     $dependencies"
     else
         venv="$repo/.venv"
-        say "deps:     missing; installing openai and openrouter into $venv"
+        say "deps:     missing; installing openai, openrouter and rich into $venv"
         if [ ! -x "$venv/bin/python" ]; then
             do_it "$python" -m venv "$venv" \
                 || die "cannot create $venv: sudo apt install python3-venv"
@@ -149,7 +149,7 @@ if [ "$skip_deps" -eq 0 ]; then
         else
             "$venv/bin/python" -m pip install --requirement "$repo/requirements.txt" \
                 || die "pip install failed: check your network connection and try again"
-            "$venv/bin/python" -c 'import openai, openrouter' >/dev/null 2>&1 \
+            "$venv/bin/python" -c 'import openai, openrouter, rich' >/dev/null 2>&1 \
                 || die "dependencies are still missing: $venv/bin/pip install -r $repo/requirements.txt"
             dependencies="installed into $venv"
             say "deps:     $dependencies"

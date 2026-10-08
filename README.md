@@ -42,7 +42,7 @@ What it does, step by step:
 1. Checks that `pieni`, `pieni.py`, and `requirements.txt` are in this checkout,
    and that the launcher is executable and free of shell syntax errors.
 2. Checks `python3` (3.8 or newer).
-3. Checks whether `openai` and `openrouter` are importable. If not, it creates
+3. Checks whether `openai`, `openrouter`, and `rich` are importable. If not, it creates
    `.venv` in this checkout and runs `pip install -r requirements.txt` there.
 4. Symlinks `~/.local/bin/pieni` to this checkout's launcher and runs
    `pieni --help` to prove the installed command works.
@@ -58,9 +58,9 @@ moving or deleting the checkout breaks it.
 
 ### Manual install
 
-If you prefer to do it by hand, create a virtual environment and install the two
-direct dependencies (`openai` and `openrouter`; everything else is the standard
-library):
+If you prefer to do it by hand, create a virtual environment and install the
+direct dependencies (`openai`, `openrouter`, and `rich` for the terminal UI;
+everything else is the standard library):
 
 ```console
 python3 -m venv .venv
