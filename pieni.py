@@ -14,13 +14,16 @@ import contextlib
 import importlib
 import json
 import os
+import queue
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +47,8 @@ DEFAULT_PERMISSIONS = "auto"
 DB_PATH = Path(APP_DIR) / "pieni.db"
 SKILLS_DIR = Path(".agents") / "skills"  # shared by many agents; under ~ and the workspace
 SKILL_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*$")
+MCP_PROTOCOL = "2025-06-18"
+MCP_TIMEOUT = 60  # seconds to wait for one MCP reply
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 CONTEXT_WINDOW = 1_000_000  # display-only assumption, not a model's real limit
@@ -82,6 +87,7 @@ HELP = f"""commands:
 /permissions    show permissions; /permissions auto|yolo changes them
 /reasoning      show effort; /reasoning EFFORT changes it (default resets it)
 /skills         list the skills loaded at startup
+/mcp            list the connected MCP servers and their tools
 !COMMAND        run a shell command locally, without adding it to the conversation
 /help           this help
 /quit, /exit    leave
@@ -93,7 +99,7 @@ HELP += "\nreasoning efforts: " + ", ".join(REASONING_EFFORTS)
 # Shown when Pieni is started with no arguments at all: it cannot guess a provider,
 # so it explains how to start instead of failing.
 USAGE = """usage: pieni [PROVIDER] [-m MODEL] [-r TASK | -p PROMPT] [--permissions auto|yolo]
-             [--streaming | --no-streaming] [--reasoning EFFORT]
+             [--streaming | --no-streaming] [--reasoning EFFORT] [--mcp NAME=COMMAND|URL] [--no-mcp]
 
 Started with no arguments, Pieni prints this help and exits. To run it, pass a
 provider, or set provider and model in ~/.pieni/pieni.ini or ./pieni.ini:
@@ -136,6 +142,10 @@ class ConfigError(PieniError):
 
 class ProviderError(PieniError):
     """The provider could not serve a request."""
+
+
+class McpError(PieniError):
+    """An MCP server could not be reached or answered with an error."""
 
 
 @dataclass
@@ -208,7 +218,7 @@ def read_config_file(path):
     """Return the [pieni] settings in path, or an empty mapping when it is absent."""
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:  # a BOM from Windows editors is fine
             parser.read_file(handle)
     except FileNotFoundError:
         return {}
@@ -288,7 +298,7 @@ def provider_kind(provider):
 
 def read_skill(path):
     """(name, description) from a SKILL.md frontmatter; ValueError when invalid."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
     end = next((i for i, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
     if not lines or lines[0].strip() != "---" or end is None:
         raise ValueError("missing --- frontmatter")
@@ -573,21 +583,34 @@ TOOL_SPECS = (
 
 
 class Toolbox:
-    """The four tools, with argument validation, permissions, and output limits."""
+    """The four tools plus any MCP tools, with validation, permissions, and output limits."""
 
-    def __init__(self, workspace, permissions):
+    def __init__(self, workspace, permissions, mcp=()):
         self.workspace = Path(workspace).resolve()
         self.permissions = permissions
         self.handlers = {"read": self.read, "write": self.write,
                          "edit": self.edit, "bash": self.bash}
         self.parameters = {spec["name"]: spec["parameters"] for spec in TOOL_SPECS}
+        self.specs = list(TOOL_SPECS)  # what the model is offered
+        self.mcp_tools = {}  # model-facing name -> (server, the server's own tool name)
+        for server in mcp:
+            for tool in server.tools:
+                name = re.sub(r"[^A-Za-z0-9_-]", "_", f"{server.name}__{tool['name']}")[:64]
+                self.mcp_tools[name] = (server, tool["name"])
+                self.specs.append({"name": name, "description": tool.get("description") or tool["name"],
+                                   "parameters": tool.get("inputSchema") or {"type": "object", "properties": {}}})
 
     def run(self, name, arguments):
         handler = self.handlers.get(name)
-        if handler is None:
-            known = ", ".join(sorted(self.handlers))
+        if handler is None and name not in self.mcp_tools:
+            known = ", ".join(sorted(self.handlers) + sorted(self.mcp_tools))
             return ToolOutcome(False, "unknown tool", f"error: unknown tool '{name}' (known: {known})")
         try:
+            if name in self.mcp_tools:  # the server validates its own arguments
+                server, tool = self.mcp_tools[name]
+                failed, text = server.call(tool, arguments)
+                return ToolOutcome(not failed, "the server reported an error" if failed else "",
+                                   truncate(f"error: {text}" if failed else text))
             self.validate(arguments, self.parameters[name])
             if name == "bash":
                 return handler(**arguments)
@@ -709,14 +732,234 @@ def assistant_message(reply):
     return message
 
 
+# --- MCP -------------------------------------------------------------------
+
+def split_command(text):
+    return [part.strip("\"'") for part in shlex.split(text, posix=os.name != "nt")]
+
+
+def mcp_entry(origin, name, raw):
+    """One server as {"command": [...], "env": {...}} or {"url": ..., "headers": {...}}."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{origin}: MCP server '{name}' must be an object")
+    expand = lambda items: {key: os.path.expandvars(str(value)) for key, value in (items or {}).items()}
+    if raw.get("url"):
+        return {"url": str(raw["url"]), "headers": expand(raw.get("headers"))}
+    command = raw.get("command")
+    command = ([command] if isinstance(command, str) else list(command or [])) + list(raw.get("args") or [])
+    if not command:
+        raise ConfigError(f"{origin}: MCP server '{name}' needs a command or a url")
+    return {"command": [str(part) for part in command], "env": expand(raw.get("env"))}
+
+
+def read_mcp_json(path):
+    """Servers from a {"mcpServers": {...}} file, the shape other agents use."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        raise ConfigError(f"{path}: expected an object with 'mcpServers'")
+    return {name: mcp_entry(path, name, raw) for name, raw in servers.items()}
+
+
+def read_mcp_ini(path):
+    """Servers from [mcp.NAME] sections with a `command` or `url` key."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(path, encoding="utf-8-sig")
+    except (configparser.Error, UnicodeDecodeError):
+        return {}  # read_config_file has already reported a broken file
+    servers = {}
+    for section in parser.sections():
+        if section.startswith("mcp."):
+            raw = dict(parser[section])
+            if "command" in raw:
+                raw["command"] = split_command(raw["command"])
+            servers[section[4:]] = mcp_entry(path, section[4:], raw)
+    return servers
+
+
+def load_mcp(cwd, home, cli=()):
+    """Merge user JSON, user INI, project JSON, project INI, then --mcp NAME=COMMAND|URL."""
+    home, cwd = Path(home) / APP_DIR, Path(cwd)
+    servers = {}
+    for path in (home / "mcp.json", home / CONFIG_FILENAME, cwd / ".mcp.json", cwd / CONFIG_FILENAME):
+        servers.update(read_mcp_json(path) if path.suffix == ".json" else read_mcp_ini(path))
+    for item in cli or ():
+        name, equals, target = item.partition("=")
+        if not (name and equals and target.strip()):
+            raise ConfigError(f"--mcp expects NAME=COMMAND or NAME=URL, not '{item}'")
+        raw = {"url": target.strip()} if re.match(r"https?://", target.strip()) else {"command": split_command(target)}
+        servers[name] = mcp_entry("--mcp", name, raw)
+    return servers
+
+
+class StdioTransport:
+    """JSON-RPC over a child process's stdin and stdout, one JSON message per line."""
+
+    kind = "stdio"
+
+    def __init__(self, command, env=None):
+        try:
+            self.process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", env={**os.environ, **(env or {})})
+        except OSError as exc:
+            raise McpError(f"cannot start {command[0]}: {exc}") from exc
+        self.lines = queue.Queue()  # a thread feeds it, so a silent server can time out
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self):
+        for line in self.process.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def send(self, message, wait_for=None, timeout=MCP_TIMEOUT):
+        """Write a message; with wait_for (a request id), return the reply carrying that id."""
+        try:
+            self.process.stdin.write(json.dumps(message) + "\n")
+            self.process.stdin.flush()
+        except OSError as exc:
+            raise McpError(f"the server is not running: {exc}") from exc
+        deadline = time.monotonic() + timeout
+        while wait_for is not None:
+            try:
+                line = self.lines.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty:
+                raise McpError(f"no reply within {timeout} seconds") from None
+            if line is None:
+                self.lines.put(None)  # later calls fail at once
+                raise McpError("the server closed the connection")
+            try:
+                reply = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Notifications and replies to abandoned requests are skipped.
+            if isinstance(reply, dict) and reply.get("id") == wait_for and "method" not in reply:
+                return reply
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.process.stdin.close()
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        self.reader.join(timeout=3)
+        self.process.stdout.close()
+
+
+class HttpTransport:
+    """JSON-RPC over Streamable HTTP: POST each message, read a JSON body or an event stream."""
+
+    kind = "http"
+
+    def __init__(self, url, headers=None):
+        self.url, self.headers = url, dict(headers or {})
+        self.session = self.version = None
+
+    def send(self, message, wait_for=None, timeout=MCP_TIMEOUT):
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                   **self.headers}
+        if self.session:
+            headers["Mcp-Session-Id"] = self.session
+        if self.version:
+            headers["MCP-Protocol-Version"] = self.version
+        request = urllib.request.Request(self.url, json.dumps(message).encode(), headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                self.session = response.headers.get("Mcp-Session-Id") or self.session
+                if wait_for is None:
+                    return None
+                if "text/event-stream" not in response.headers.get("Content-Type", ""):
+                    return json.loads(response.read())
+                for raw in response:  # server-sent events: the reply is one "data:" line
+                    line = raw.decode("utf-8").strip()
+                    reply = json.loads(line[5:]) if line.startswith("data:") else None
+                    if isinstance(reply, dict) and reply.get("id") == wait_for and "method" not in reply:
+                        return reply
+        except (OSError, ValueError) as exc:  # URLError, HTTPError, timeouts, bad JSON
+            raise McpError(f"HTTP request failed: {exc}") from exc
+        raise McpError("the event stream ended without a reply")
+
+    def close(self):
+        if self.session:  # tell the server the session is over; it may refuse
+            with contextlib.suppress(OSError, ValueError):
+                urllib.request.urlopen(urllib.request.Request(
+                    self.url, headers={**self.headers, "Mcp-Session-Id": self.session},
+                    method="DELETE"), timeout=5).close()
+
+
+class McpServer:
+    """A connected MCP server: handshake, tool list, and tool calls."""
+
+    def __init__(self, name, transport):
+        self.name, self.transport, self.tools, self._id = name, transport, [], 0
+        info = self.request("initialize", {"protocolVersion": MCP_PROTOCOL, "capabilities": {},
+                                           "clientInfo": {"name": "pieni", "version": VERSION}})
+        transport.version = info.get("protocolVersion") or MCP_PROTOCOL
+        transport.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        cursor = None
+        while True:
+            page = self.request("tools/list", {"cursor": cursor} if cursor else {})
+            self.tools += [tool for tool in page.get("tools") or []
+                           if isinstance(tool, dict) and tool.get("name")]
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+
+    def request(self, method, params):
+        self._id += 1
+        reply = self.transport.send({"jsonrpc": "2.0", "id": self._id, "method": method,
+                                     "params": params}, wait_for=self._id)
+        if not isinstance(reply, dict):
+            raise McpError(f"{method}: the server sent an invalid reply")
+        if "error" in reply:
+            raise McpError(f"{method}: {attribute(reply['error'], 'message', reply['error'])}")
+        return reply.get("result") or {}
+
+    def call(self, tool, arguments):
+        """(failed, text) for one tool call; non-text content is only named, never passed on."""
+        result = self.request("tools/call", {"name": tool, "arguments": arguments})
+        parts = [item.get("text", "") if item.get("type") == "text"
+                 else f"[{item.get('type', 'unknown')} content omitted]"
+                 for item in result.get("content") or [] if isinstance(item, dict)]
+        return bool(result.get("isError")), "\n".join(parts) or "(no output)"
+
+    def close(self):
+        self.transport.close()
+
+
+def connect_mcp(configs):
+    """Connect to every configured server; one that fails is reported and skipped."""
+    servers = []
+    for name, config in configs.items():
+        transport = None
+        try:
+            transport = (HttpTransport(config["url"], config["headers"]) if "url" in config
+                         else StdioTransport(config["command"], config["env"]))
+            servers.append(McpServer(name, transport))
+        except McpError as exc:
+            print(f"warning: skipped MCP server '{name}': {exc}", file=sys.stderr)
+            if transport is not None:
+                transport.close()
+    return servers
+
+
 # --- Providers -------------------------------------------------------------
 
-def chat_tools():
-    return [{"type": "function", "function": spec} for spec in TOOL_SPECS]
+def chat_tools(specs=TOOL_SPECS):
+    return [{"type": "function", "function": spec} for spec in specs]
 
 
-def responses_tools():
-    return [{"type": "function", **spec} for spec in TOOL_SPECS]
+def responses_tools(specs=TOOL_SPECS):
+    return [{"type": "function", **spec} for spec in specs]
 
 
 def to_chat_messages(messages):
@@ -1017,12 +1260,13 @@ class Provider:
         self._close = close
         self.streaming = streaming
         self.reasoning = reasoning
+        self.specs = TOOL_SPECS  # replaced by the Agent with built-in plus MCP tools
 
     def complete(self, messages, use_tools=True, on_text=None):
         try:
             call = {"responses": call_responses, "openrouter": call_openrouter}.get(
                 self.kind, call_chat_completions)
-            tools = responses_tools() if self.kind == "responses" else chat_tools()
+            tools = (responses_tools if self.kind == "responses" else chat_tools)(self.specs)
             options = {"reasoning": self.reasoning}
             if self.kind == "chat":
                 options["deepseek"] = True
@@ -1216,7 +1460,7 @@ class Agent:
 
     def __init__(self, provider, store, session_id, instructions, messages,
                  workspace, permissions, out=print, dots=None, stream_out=None,
-                 answer_out=None, end_stream=None, skills=None):
+                 answer_out=None, end_stream=None, skills=None, mcp=()):
         self.provider = provider
         self.store = store
         self.session_id = session_id
@@ -1224,7 +1468,9 @@ class Agent:
         self.messages = list(messages)  # conversation only, instructions excluded
         self.workspace = Path(workspace).resolve()
         self.permissions = permissions
-        self.tools = Toolbox(self.workspace, permissions)
+        self.tools = Toolbox(self.workspace, permissions, mcp)
+        self.mcp = list(mcp)
+        self.specs = provider.specs = self.tools.specs  # the model sees built-in and MCP tools
         self.out = out
         self.stream_out = stream_out or (lambda text: print(text, end="", flush=True)
                                         if out is print else out(text))
@@ -1247,7 +1493,7 @@ class Agent:
     def context_tokens(self):
         """Rough size of the active context: instructions, tools, and messages."""
         payload = json.dumps(self.wire_messages(), ensure_ascii=False, default=str)
-        payload += json.dumps(TOOL_SPECS, ensure_ascii=False)
+        payload += json.dumps(self.specs, ensure_ascii=False)
         return estimate_tokens(payload)
 
     # -- model calls --------------------------------------------------------
@@ -1272,7 +1518,7 @@ class Agent:
         except (ProviderError, KeyboardInterrupt):
             if usage is not None:
                 # No completed usage report: estimate this attempt without retrying it.
-                inputs, outputs = estimated_pair(messages, TOOL_SPECS if use_tools else None,
+                inputs, outputs = estimated_pair(messages, self.specs if use_tools else None,
                                                  "".join(partial), [])
                 usage.record(inputs, outputs, True)
             raise
@@ -1384,6 +1630,11 @@ class Agent:
             self.out("\n".join(f"{name}: {description} ({path})"
                               for name, (description, path) in self.skills.items())
                      or f"no skills found in ~/{SKILLS_DIR.as_posix()} or ./{SKILLS_DIR.as_posix()}")
+        elif command == "/mcp":
+            self.out("\n".join(f"{server.name} [{server.transport.kind}]: "
+                              + (", ".join(tool["name"] for tool in server.tools) or "no tools")
+                              for server in self.mcp)
+                     or "no MCP servers connected (see --mcp, .mcp.json, or [mcp.NAME] in pieni.ini)")
         elif command == "/permissions":
             self.set_permissions(argument)
         elif command == "/reasoning":
@@ -1482,6 +1733,10 @@ def parse_args(argv):
                            default=None, help="stream model replies (default)")
     streaming.add_argument("--no-streaming", dest="streaming", action="store_false",
                            help="wait for complete model replies")
+    parser.add_argument("--mcp", action="append", metavar="NAME=COMMAND|URL",
+                        help="connect an MCP server (repeatable): a command to start or an http(s) URL")
+    parser.add_argument("--no-mcp", action="store_true",
+                        help="do not start any MCP servers, whatever the configuration says")
     return parser.parse_args(argv)
 
 
@@ -1555,7 +1810,10 @@ def run_agent(arguments):
     if arguments.prompt is not None:
         with contextlib.closing(provider):
             return run_prompt(provider, arguments.prompt)
-    with contextlib.closing(provider), contextlib.closing(Store(workspace / DB_PATH)) as store:
+    home = os.path.expanduser("~")
+    mcp_configs = {} if arguments.no_mcp else load_mcp(workspace, home, arguments.mcp)
+    with contextlib.closing(provider), contextlib.closing(Store(workspace / DB_PATH)) as store, \
+            contextlib.ExitStack() as stack:
         session_id, messages = store.resume(provider.name, provider.model, str(workspace))
         if session_id is None:
             session_id = store.start_session(provider.name, provider.model, str(workspace))
@@ -1577,9 +1835,12 @@ def run_agent(arguments):
             say(YOLO_WARNING)
         hooks = ({"out": ui.out, "answer_out": ui.markdown, "stream_out": ui.stream,
                   "end_stream": ui.end} if ui else {})
-        skills = find_skills(workspace, os.path.expanduser("~"))
+        skills = find_skills(workspace, home)
+        mcp = connect_mcp(mcp_configs)
+        for server in mcp:
+            stack.callback(server.close)
         agent = Agent(provider, store, session_id, build_instructions(workspace, skills=skills),
-                      messages, workspace, permissions, skills=skills, **hooks)
+                      messages, workspace, permissions, skills=skills, mcp=mcp, **hooks)
         if arguments.run is not None:
             if not arguments.run.strip():
                 raise ConfigError("-r/--run needs a non-empty prompt")

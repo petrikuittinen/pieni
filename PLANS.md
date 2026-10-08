@@ -8,8 +8,9 @@ be easy to run, understand, fork, and extend; it is not a production agent platf
 
 All agent code lives in `pieni.py`, with a small Bash launcher named `pieni` and
 tests in separate files. The original ~750-line target was exceeded on purpose as
-features were added; the guideline is now **well under 2,000 lines** (about 1,600
-today). Dependencies: the standard library plus three direct packages in
+features were added; the guideline is now **well under 2,000 lines** (about 1,900
+today, so little room is left). Dependencies: the standard library plus three direct
+packages in
 `requirements.txt`: `openai`, `openrouter`, and `rich` (terminal display only).
 
 ## Status: the planned scope is implemented
@@ -31,6 +32,13 @@ decisions that still constrain changes.
   enter the system prompt; the model loads a skill with `read` (which may read the
   user skills directory without approval). `/skills` lists them. Bundled example:
   `.agents/skills/web-fetch`.
+- **MCP client:** tools only, over stdio and Streamable HTTP, written with the standard
+  library. Servers come from `~/.pieni/mcp.json`, `[mcp.NAME]` INI sections,
+  `.mcp.json` in the workspace, and repeatable `--mcp NAME=COMMAND|URL`, later sources
+  winning; `--no-mcp` disables them; `${VAR}` is expanded in `env` and `headers`.
+  Tools appear to the model as `server__tool` and the server validates arguments.
+  A server that fails to start is skipped with a warning. `/mcp` lists servers.
+  Bundled example: `examples/mcp_fetch_server.py` (stdio or `--http`).
 - **Configuration:** `configparser` INI, user file then launch-directory file then
   CLI; keys `provider`, `model`, `permissions`, `streaming`, `reasoning`. API keys
   stay in environment variables.
@@ -42,7 +50,7 @@ decisions that still constrain changes.
 - **Interaction:** tool status lines with timing, per-task token/context/time
   summary, a labeled thinking trace, Ctrl+C handling, SQLite save/resume in
   `.pieni/pieni.db`, and the commands `/compact`, `/compact all`, `/permissions`,
-  `/reasoning`, `/skills`, `!COMMAND`, `/help`, `/quit`, `/exit`.
+  `/reasoning`, `/skills`, `/mcp`, `!COMMAND`, `/help`, `/quit`, `/exit`.
 - **Terminal UI:** on an interactive terminal, `rich` renders model replies as
   Markdown (live while streaming) and colors status lines; other text is never
   Markdown. Up/Down recall earlier prompts through `readline` where available.
@@ -64,6 +72,9 @@ Constraints that still apply:
 - `yolo` skips approval and guard checks, not argument validation or timeouts.
 - Headless mode denies anything needing approval and reports the denial to the
   model. Approval covers only the proposed action.
+- MCP is the exception: servers the user configured are trusted, and their tool
+  calls are neither checked nor prompted. A project `.mcp.json` therefore runs
+  commands at startup; this is documented, and `--no-mcp` is the guard.
 
 ### Providers and CLI
 
@@ -84,8 +95,9 @@ transaction, and a failed compaction leaves it unchanged.
 - Local Qwen smoke tests cover streaming and buffered replies, all four tools,
   Unicode files, and resume. Hosted streaming and hosted reasoning behavior remain
   unverified after later refactors.
-- The Rich UI and skills are covered by offline tests; they have not been
-  exercised in a long real-model session on every platform.
+- The Rich UI, skills, and MCP are covered by offline tests (MCP over loopback
+  stdio and HTTP only); they have not been exercised in a long real-model session
+  or against third-party MCP servers.
 - The 14 `bash`-dependent tests fail on Windows because they expect a POSIX shell.
 
 ## Deferred, not promised
@@ -96,7 +108,9 @@ transaction, and a failed compaction leaves it unchanged.
   discovery, and automatic compaction.
 - Runtime provider/model switching.
 - Web search as a built-in tool (the `web-fetch` skill covers simple downloads).
-- MCP, plugins, multiple agent modes, and a true OS sandbox.
+- MCP resources, prompts, sampling, OAuth, `listChanged` refresh, reloading servers
+  mid-session, and approval prompts for MCP tools.
+- Plugins, multiple agent modes, and a true OS sandbox.
 - Beyond basic skills: running skill scripts as a managed step, `allowed-tools`,
   `.claude/skills` and `.github/skills`, a `/skill NAME` command, and reloading
   skills during a session.

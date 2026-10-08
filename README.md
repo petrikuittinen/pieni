@@ -2,19 +2,24 @@
 
 **v0.15** — written by Petri Kuittinen, 2026.
 
-A tiny AI coding agent written in Python: one file of about 1600 lines of code
+A tiny AI coding agent written in Python: one file of about 1900 lines of code
 (`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
 agents work — read it, run it, fork it, change it. Despite its small size, pieni
 has a best-effort destructive command guard (DCG), a Rich terminal UI with
-Markdown rendering and prompt history, and basic Agent Skills support. It supports hundreds
+Markdown rendering and prompt history, basic Agent Skills support, and a minimal
+MCP client for extra tools. It supports hundreds
 of models and can be extended. It can even generate you games or run web browser.
 Small, but works.
 
 "pieni" is Finnish and means "small".
 
 Read [How Pieni works—and how AI harnesses and agents work in general](docs/how-pieni-works.md)
-for a walkthrough of the loop, tools, permissions, context, skills, the terminal UI,
+for a walkthrough of the loop, tools, permissions, context, skills, MCP, the terminal UI,
 and providers.
+
+New to this? The beginner guides have copy-and-paste steps for Ubuntu 24.04 and
+Windows 11 PowerShell: [How to use skills](docs/how-to-use-skills.md) and
+[How to use MCP servers](docs/how-to-use-mcps.md).
 
 ## Status
 
@@ -126,6 +131,7 @@ without retrying with another setting.
 ./pieni openai -m "MODEL" --no-streaming       # wait for a complete reply
 ./pieni openai -m "MODEL" --reasoning high     # set reasoning effort
 ./pieni deepseek -m "MODEL" --streaming       # override streaming = false
+./pieni openai -m "MODEL" --mcp fetch="python examples/mcp_fetch_server.py"  # add an MCP server
 ./pieni openai -m "gpt-6-luna" -p "What is the capital of Finland?"
 ```
 
@@ -201,6 +207,7 @@ The same list is printed when Pieni is started with no arguments.
 /permissions    show permissions; /permissions auto|yolo changes them
 /reasoning      show effort; /reasoning EFFORT changes it (default resets it)
 /skills         list the skills loaded at startup
+/mcp            list the connected MCP servers and their tools
 !COMMAND        run a local shell command, without adding it to the conversation
 /help           concise help
 /quit, /exit    leave
@@ -241,6 +248,8 @@ output, and reports failures back to the model:
   ambiguous.
 - `bash` — run a shell command in the workspace with a timeout.
 
+Tools offered by [MCP servers](#mcp-servers) are added to this list.
+
 A task gets at most **500 model rounds**. One round may ask for several tool calls
 at once, so this budgets the conversation with the model, not the number of
 individual tool calls. When the rounds run out, Pieni prints the task summary and
@@ -272,7 +281,73 @@ teaches the model to download pages with `curl` or `wget`, sending a browser
 `User-Agent` because some sites reject requests without one. A skill is trusted
 instruction text: read skills from other people before using them. The
 [guide](docs/how-pieni-works.md#skills-instructions-loaded-on-demand) explains how
-skills work in agents in general.
+skills work in agents in general. For step-by-step instructions, with examples you can
+copy and paste on Ubuntu and Windows, see [How to use skills](docs/how-to-use-skills.md).
+
+## MCP servers
+
+[MCP](https://modelcontextprotocol.io/) (Model Context Protocol) lets a separate
+program offer tools to any agent. At startup Pieni connects to the servers you
+configure, lists their tools, and offers them to the model next to its four built-in
+tools. Both standard transports work: **stdio** (Pieni starts the server as a child
+process) and **Streamable HTTP** (a `url`). Only MCP *tools* are supported, not
+resources, prompts, sampling, or OAuth.
+
+Configure servers in any of these places; when a name appears more than once, the
+later source wins:
+
+1. `~/.pieni/mcp.json`
+2. `[mcp.NAME]` sections in `~/.pieni/pieni.ini`
+3. `.mcp.json` in the workspace
+4. `[mcp.NAME]` sections in `pieni.ini` in the workspace
+5. `--mcp NAME=COMMAND` or `--mcp NAME=URL` on the command line (repeatable)
+
+The JSON files use the same `mcpServers` shape as other agents:
+
+```json
+{"mcpServers": {
+  "fetch": {"command": "python", "args": ["examples/mcp_fetch_server.py"]},
+  "remote": {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ${EXAMPLE_TOKEN}"}}
+}}
+```
+
+```ini
+[mcp.fetch]
+command = python examples/mcp_fetch_server.py
+
+[mcp.remote]
+url = https://example.com/mcp
+```
+
+```console
+./pieni openai -m "MODEL" --mcp fetch="python examples/mcp_fetch_server.py"
+```
+
+JSON entries may also set `env`, and `${VAR}` in `env` and `headers` values is
+expanded from the environment, so secrets stay out of the file. INI sections take only
+`command` or `url`. The model sees each tool as `NAME__TOOL` (for example
+`fetch__fetch`). `/mcp` lists the connected servers and their tools, and `--no-mcp`
+starts none, whatever the configuration says. Servers are connected once at startup;
+one that fails to start is skipped with a warning on stderr, and a stdio server's own
+stderr output is discarded.
+
+**The example server.** `examples/mcp_fetch_server.py` uses only the standard library
+and has one tool, `fetch(url, max_chars)`, which downloads a page, sends a browser
+`User-Agent`, and returns plain text. It speaks stdio by default, or HTTP with
+`--http PORT`. It refuses non-HTTP URLs and loopback, private, and link-local addresses
+(checked on every redirect) unless started with `--allow-private`, so a model cannot
+use it to probe your network. It is an example, not a hardened proxy.
+
+**Trust.** Servers you configure are trusted: their tool calls run without approval
+prompts, also in headless `-r` mode, and neither the file-path checks nor the
+destructive-command guard apply to what a server does. A `.mcp.json` in a repository
+you have just cloned starts its commands the moment you launch Pieni there, so read
+it first or pass `--no-mcp`. Tool descriptions and results are untrusted text from
+the server, and an HTTP server receives every argument the model sends. The
+[guide](docs/how-pieni-works.md#mcp-tools-from-other-programs) explains the protocol
+and these risks. For step-by-step instructions, with two free online servers to try and
+copy-and-paste commands for Ubuntu and Windows, see
+[How to use MCP servers](docs/how-to-use-mcps.md).
 
 ## Limits
 
@@ -373,6 +448,8 @@ not a claim about the selected model.
   paths outside them need approval, with `..` and symlinks resolved first. The one
   exception is reading `~/.agents/skills`, so user-level skills can be loaded.
 - `yolo` skips approval and guard checks, but not argument validation or timeouts.
+- Tools from MCP servers you configured run without approval, and these checks do not
+  apply to them (see [MCP servers](#mcp-servers)).
 - The guard is best-effort pattern matching. It can miss destructive commands and
   flag harmless ones, and it is **not** a sandbox: `bash` runs with your user's
   filesystem and network access.
@@ -391,7 +468,7 @@ so no network access or API calls are needed. Run the agent and streaming tests
 alongside the installer tests:
 
 ```console
-python3 -m unittest tests.test_pieni tests.test_streaming tests.test_controls
+python3 -m unittest tests.test_pieni tests.test_streaming tests.test_controls tests.test_mcp
 python3 -m unittest tests.test_install  # installer, against temporary copies
 ```
 
@@ -426,5 +503,6 @@ the tests use temporary workspaces.
 ## Not included
 
 Live reasoning streaming, automatic compaction, runtime provider/model switching,
-web search, MCP, plugins, multiple agent modes,
+web search, plugins, multiple agent modes,
+MCP resources/prompts/OAuth,
 and a real OS sandbox. See `PLANS.md` for the scope and `AGENTS.md` for the rules.

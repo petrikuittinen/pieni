@@ -14,7 +14,7 @@ what to do next — instead of answering in one shot. Those steps are the same i
 agents, so understanding them here should also help you use those agents more
 deliberately.
 
-Pieni is just [one Python file](../pieni.py), with about 1600 lines of code.
+Pieni is just [one Python file](../pieni.py), with about 1900 lines of code.
 This guide follows its actual implementation.
 
 ## Contents
@@ -27,6 +27,7 @@ This guide follows its actual implementation.
 - [The destructive-command guard](#the-destructive-command-guard)
 - [Context, saved history, and compaction](#context-saved-history-and-compaction)
 - [Skills: instructions loaded on demand](#skills-instructions-loaded-on-demand)
+- [MCP: tools from other programs](#mcp-tools-from-other-programs)
 - [Provider adapters](#provider-adapters)
 - [Reading and testing the implementation](#reading-and-testing-the-implementation)
 
@@ -157,7 +158,10 @@ Useful tools found in larger harnesses but absent here include:
 - Background process tools: start a development server, retain a process ID,
   inspect output, and stop it later.
 - Subagent tools with separate contexts and controlled result sharing.
-- MCP (Model Context Protocol) clients, which expose outside services as extra tools the agent can discover at runtime.
+
+Pieni's own four tools can be extended from outside: it is a minimal
+[MCP client](#mcp-tools-from-other-programs), so a separate program can offer more
+tools without any change to `pieni.py`.
 
 Some tasks can be approximated with shell commands. Dedicated tools make the
 arguments, results, lifecycle, and permission checks more explicit. A shell that
@@ -324,6 +328,8 @@ It is not a guarantee that outside files cannot be accessed:
   allocated to Pieni. Ordinary OS permissions still apply there.
 - Resolving and checking a path is separate from opening it. This does not close
   filesystem race conditions or provide a complete hard-link defense.
+- Tools from [MCP servers](#mcp-tools-from-other-programs) are not file tools or shell
+  commands, so neither these checks nor the destructive-command guard apply to them.
 
 For actual containment, constrain the process and its children using an appropriate
 OS sandbox, container, or VM, with limited mounts, credentials, and network access.
@@ -593,6 +599,117 @@ the optional `allowed-tools` field, skills in other folder conventions
 (`.claude/skills`, `.github/skills`), reloading during a session, and
 user-typed skill invocation.
 
+## MCP: tools from other programs
+
+Every tool in Pieni's `TOOL_SPECS` is Python code inside `pieni.py`. That does not scale:
+if every agent had to implement its own database, issue-tracker, browser, and web-fetch
+tools, every one of those integrations would be written many times. The **Model Context
+Protocol (MCP)** is a standard that splits the job. A separate program, an **MCP server**,
+describes and runs a set of tools; any agent that speaks the protocol, an **MCP client**,
+can list those tools and call them. Write the integration once and every client can use it.
+
+This is a different idea from a skill. A skill is Markdown that *tells the model how to
+use tools it already has*. An MCP server *adds tools*: new capabilities that run in
+another process, possibly on another machine.
+
+### What the protocol looks like
+
+MCP messages are JSON-RPC 2.0: small JSON objects with a `method` and an `id`, answered by
+a `result` or an `error`. A session has three steps, all visible in `McpServer`:
+
+1. **Handshake.** The client sends `initialize` with the protocol version it speaks. The
+   server replies with its own version and capabilities, and the client confirms with an
+   a `notifications/initialized` message (a notification has no `id` and gets no reply).
+2. **Discovery.** `tools/list` returns each tool's `name`, `description`, and
+   `inputSchema`, a JSON Schema in the same shape as Pieni's own tool schemas. Long lists
+   are paged with a `nextCursor`.
+3. **Calls.** `tools/call` carries the tool name and arguments and returns `content`: a list
+   of text, image, or other items, plus `isError`. A failure *inside* a tool comes back as
+   a normal result with `isError: true`, so the model can read it and react; a failure of
+   the *request* itself, such as an unknown tool, is a JSON-RPC error.
+
+The messages travel over a **transport**. Pieni supports the two standard ones:
+
+| Transport | How it works | In Pieni |
+| --- | --- | --- |
+| stdio | The client starts the server as a child process and exchanges one JSON message per line on its stdin and stdout. | `StdioTransport` |
+| Streamable HTTP | The client POSTs each message to one URL. The reply is either a JSON body or a stream of server-sent events; a session id header ties requests together. | `HttpTransport` |
+
+The call/result pairing is the same idea as the model's own [function calling](#a-tool-call-from-request-to-result):
+the model asks for a tool, the harness executes it, and the result goes back into the
+conversation. MCP only changes *where* the harness executes it: in another process.
+
+### How Pieni does it
+
+The client is about 200 lines, using only the standard library:
+
+- `load_mcp()` merges the configuration (user and project `mcp.json` files, `[mcp.NAME]`
+  INI sections, and `--mcp` arguments) into one dictionary of servers. The JSON shape is
+  the `mcpServers` object other agents read, so one `.mcp.json` can serve several tools.
+- `connect_mcp()` opens each server and runs the handshake. A server that fails to start
+  is reported on stderr and skipped, so one broken server does not stop Pieni.
+- `Toolbox` copies each server's tools into the list offered to the model, naming them
+  `server__tool` (letters, digits, `_`, and `-`, at most 64 characters, which providers
+  require). `Provider` and the token estimate use that combined list, so the model
+  sees built-in and MCP tools alike.
+- When the model calls such a tool, `Toolbox.run()` forwards the arguments untouched, because the
+  server validates them, and returns the result as an ordinary tool message. Text is
+  passed on, other content types are named but not forwarded, and the result is cut to
+  the usual 65,536 characters. A tool error, timeout, or crashed server becomes a normal
+  `error:` result, the same as a failing `bash` command.
+- `StdioTransport` reads the server's output on a thread and passes lines through a queue,
+  which gives a timeout even though a blocked pipe read cannot time out. It ignores
+  notifications and late replies to abandoned requests, so Ctrl+C during a call leaves
+  no confusion behind.
+- `/mcp` lists connected servers and tools; `--no-mcp` starts none.
+
+The bundled `examples/mcp_fetch_server.py` is a complete server in about 200 lines: it
+answers `initialize`, `tools/list`, and `tools/call`, offers one `fetch` tool, and can
+run over stdio or HTTP. Reading it next to `McpServer` shows both halves of the protocol.
+Because a fetch tool can reach any address the *server's* machine can, it refuses
+loopback, private, and link-local addresses unless told otherwise.
+
+### Why it is useful, and what it costs
+
+- **Reuse.** A server written for one agent works in others, and a tool you build for
+  Pieni's loop can be used elsewhere. Capabilities such as web fetching, databases, or
+  issue trackers become plug-ins rather than harness code.
+- **Small harness.** Pieni stays near 1,900 lines while still reaching those capabilities,
+  because the work lives in the servers.
+- **Isolation of effort, not of trust.** The server is a separate process, but nothing
+  contains it: it runs with your permissions.
+- **Context cost.** Every tool's name, description, and schema is sent with every request.
+  Many servers with many tools can use a large part of the context before the user types
+  anything, which is one reason skills are loaded on demand instead.
+
+### Trust and safety
+
+MCP expands what the agent can do, and none of Pieni's checks apply to it:
+
+- **Servers you configure are trusted.** Pieni runs their tool calls without an approval
+  prompt, including in headless mode, and the file-path checks and the
+  [destructive-command guard](#the-destructive-command-guard) do not see them. The MCP
+  specification recommends a human in the loop for sensitive operations; Pieni leaves that
+  decision to you by not starting servers you have not configured.
+- **A project `.mcp.json` is code that runs at startup.** A stdio server is a command Pieni
+  executes as soon as it launches. A repository you have just cloned can therefore run
+  programs on your machine through its `.mcp.json` or `pieni.ini`. Read those files first,
+  or start with `--no-mcp`.
+- **Tool descriptions and results are untrusted.** A server, or a web page it fetched, can
+  put text in a result that looks like instructions. The model may follow it. This is the
+  same prompt-injection risk as a file the agent reads, and the `web-fetch` skill and the
+  example server both treat downloaded content as data.
+- **HTTP servers see your data.** Every argument the model sends goes to the remote
+  machine, and headers such as an `Authorization` token are sent with each request. Use
+  `${VAR}` in `headers` and `env` values so secrets stay in environment variables and out of
+  files you might commit.
+- **Local servers can reach your network.** A fetch server runs on your machine, so a
+  careless one is a way for a model to probe addresses it could not otherwise reach.
+
+Pieni leaves out the rest of the protocol: resources and prompts, sampling and other
+server-to-client requests, OAuth for remote servers, change notifications
+(`listChanged`), reloading servers during a session, and any approval prompts.
+
 ## Provider adapters
 
 The loop should not need to know whether a provider calls an operation
@@ -735,6 +852,7 @@ Use function names rather than fixed line numbers, which change as the file does
 | What does the model receive? | `Agent.wire_messages()`, `build_instructions()`, provider converters |
 | How are skills found and listed? | `find_skills()`, `read_skill()`, `build_instructions()`, `Agent.handle_command()` (`/skills`) |
 | How is output drawn? | `RichUI`, `line_style()`, the `out`/`stream_out`/`answer_out`/`end_stream` hooks in `run_agent()` |
+| How are MCP servers configured and called? | `load_mcp()`, `StdioTransport`, `HttpTransport`, `McpServer`, `connect_mcp()`, `Toolbox.run()` |
 | What survives restart or compaction? | `Store`, `compaction_history()`, `Agent.compact()` |
 
 `AGENTS.md` is loaded only from the starting workspace root and combined with the
