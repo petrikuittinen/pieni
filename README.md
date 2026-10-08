@@ -2,17 +2,19 @@
 
 **v0.15** — written by Petri Kuittinen, 2026.
 
-A tiny AI coding agent written in Python: one file of about 1500 lines of code
+A tiny AI coding agent written in Python: one file of about 1600 lines of code
 (`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
 agents work — read it, run it, fork it, change it. Despite its small size, pieni
-has a best-effort destructive command guard (DCG). It supports hundreds
+has a best-effort destructive command guard (DCG), a Rich terminal UI with
+Markdown rendering and prompt history, and basic Agent Skills support. It supports hundreds
 of models and can be extended. It can even generate you games or run web browser.
 Small, but works.
 
 "pieni" is Finnish and means "small".
 
 Read [How Pieni works—and how AI harnesses and agents work in general](docs/how-pieni-works.md)
-for a walkthrough of the loop, tools, permissions, context, and providers.
+for a walkthrough of the loop, tools, permissions, context, skills, the terminal UI,
+and providers.
 
 ## Status
 
@@ -151,6 +153,23 @@ pieni>
 
 Headless runs (`-r`) print no banner, so their output stays script-friendly.
 
+### Rich terminal UI
+
+On an interactive terminal Pieni uses [Rich](https://rich.readthedocs.io/) for display:
+
+- Model replies are rendered as Markdown, with headings, lists, bold text, and
+  syntax-highlighted code blocks. While a reply streams, the view updates live.
+- Everything that is not a model reply stays plain text, never Markdown: tool lines,
+  errors, `!command` output, `/help`, and the token summary. They are only colored
+  (green `ok`, red errors, dim token and thinking lines, cyan startup lines).
+- Up and Down recall earlier prompts, as in a Bash shell, through Python's
+  `readline` module. Windows consoles provide their own history. History is kept for
+  the running session only.
+
+When output is piped or redirected, and for `-r` and `-p`, Pieni prints plain text.
+Some shell windows, such as Git Bash (mintty), connect Python through a pipe and so
+look "redirected"; use PowerShell, cmd, or Windows Terminal for the colored UI there.
+
 ## Headless mode
 
 ```console
@@ -230,7 +249,8 @@ keeps the context, so you can ask it to continue.
 ## Skills
 
 A skill is a folder with a `SKILL.md` file, in the shared
-[Agent Skills](https://agentskills.io/specification) format. Pieni looks in
+[Agent Skills](https://agentskills.io/specification) format: reusable instructions
+that the model loads only when a task needs them. Pieni looks in
 `~/.agents/skills/` and `.agents/skills/` in the workspace; a project skill
 overrides a user skill with the same name.
 
@@ -248,7 +268,11 @@ When a task matches, the model reads the full `SKILL.md` with the `read` tool.
 `description` is 1-1024 characters. Other fields are ignored, and invalid skills
 are skipped with a warning on stderr. Skills are loaded once at startup; `/skills`
 lists them. The repository includes an example, `.agents/skills/web-fetch`, which
-teaches the model to download pages with `curl` or `wget`.
+teaches the model to download pages with `curl` or `wget`, sending a browser
+`User-Agent` because some sites reject requests without one. A skill is trusted
+instruction text: read skills from other people before using them. The
+[guide](docs/how-pieni-works.md#skills-instructions-loaded-on-demand) explains how
+skills work in agents in general.
 
 ## Limits
 
@@ -279,7 +303,7 @@ figure above is only the display assumption.
 ## Output
 
 Model reply text is streamed as it arrives, in both interactive and headless
-mode. Pieni assembles full tool arguments before executing any tools and saves
+mode (as live Markdown on an interactive terminal, plain text otherwise). Pieni assembles full tool arguments before executing any tools and saves
 only completed replies. Final answers are not printed twice. Provider token
 usage is taken from the completed stream when available, otherwise estimated.
 
@@ -346,7 +370,8 @@ not a claim about the selected model.
   `shutdown`, `git push --force`, `DROP TABLE`, …). Flagged commands need your
   approval.
 - File tools work inside the launch directory and the system temp directory;
-  paths outside them need approval, with `..` and symlinks resolved first.
+  paths outside them need approval, with `..` and symlinks resolved first. The one
+  exception is reading `~/.agents/skills`, so user-level skills can be loaded.
 - `yolo` skips approval and guard checks, but not argument validation or timeouts.
 - The guard is best-effort pattern matching. It can miss destructive commands and
   flag harmless ones, and it is **not** a sandbox: `bash` runs with your user's

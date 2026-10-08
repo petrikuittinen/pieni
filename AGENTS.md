@@ -17,7 +17,7 @@ working example over a complete product. Follow the scope and milestones in
   use the `openrouter` SDK for OpenRouter. Keep provider handling thin.
 - Use `configparser` for INI settings: user file first, launch-directory file
   second, and explicit CLI arguments last. Keep configuration small.
-- Aim for about 1700 lines of agent code. This is a guideline, not a reason to
+- Keep agent code well under 2000 lines (about 1600 today). This is a guideline, not a reason to
   compress code into unreadable one-liners or omit necessary checks.
 - Prefer straightforward functions and a few clearly separated sections for
   configuration, tools, permissions, persistence, and the agent loop.

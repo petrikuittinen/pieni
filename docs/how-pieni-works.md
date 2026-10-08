@@ -14,7 +14,7 @@ what to do next — instead of answering in one shot. Those steps are the same i
 agents, so understanding them here should also help you use those agents more
 deliberately.
 
-Pieni is just [one Python file](../pieni.py), with about 1500 lines of code.
+Pieni is just [one Python file](../pieni.py), with about 1600 lines of code.
 This guide follows its actual implementation.
 
 ## Contents
@@ -22,9 +22,11 @@ This guide follows its actual implementation.
 - [What surrounds the model](#what-surrounds-the-model)
 - [A tool call, from request to result](#a-tool-call-from-request-to-result)
 - [The agentic loop](#the-agentic-loop)
+- [The terminal interface](#the-terminal-interface)
 - [File permissions: the minimal sandbox](#file-permissions-the-minimal-sandbox)
 - [The destructive-command guard](#the-destructive-command-guard)
 - [Context, saved history, and compaction](#context-saved-history-and-compaction)
+- [Skills: instructions loaded on demand](#skills-instructions-loaded-on-demand)
 - [Provider adapters](#provider-adapters)
 - [Reading and testing the implementation](#reading-and-testing-the-implementation)
 
@@ -241,6 +243,44 @@ The first runs the loop and saves the conversation. The second sends only that
 user prompt, with tools disabled: no project `AGENTS.md`, no resumed session,
 and no saved conversation. It makes one model request and exits.
 
+## The terminal interface
+
+The loop does not print anything itself. `Agent` sends every line through a few
+plain callbacks, and `run_agent()` chooses what they are connected to:
+
+| Callback | What it carries | Plain terminal | Interactive terminal (`RichUI`) |
+| --- | --- | --- | --- |
+| `out` | status, tool, error, and token-usage lines, `!command` output, help | `print` | colored plain text |
+| `stream_out` / `end_stream` | reply text as it streams in, and its end | raw `print` | live Markdown view |
+| `answer_out` | a complete reply when streaming is off | `out` | rendered Markdown |
+
+The [Rich](https://rich.readthedocs.io/) library is used only on an interactive
+terminal in the interactive mode. With `-r`, `-p`, or output piped to a file, Pieni
+prints plain text, so scripts and tests see the same bytes as before. This is the
+main design point: the interface is a thin layer around the loop, which neither
+knows nor cares whether Rich is present.
+
+Two rules keep it honest:
+
+- **Only model text is Markdown.** A reply containing `**done**` and a fenced code
+  block is rendered with bold text and highlighted code. Tool lines, errors, `!command`
+  output, and `/help` go through `RichUI.out()`, which never interprets Markdown or
+  Rich markup, so a file name such as `[draft].md` or output containing `**` is
+  shown exactly as it is. Status lines only get a color from their start or end
+  (`error` red, `-> ok, 12 ms` green).
+- **Streaming stays correct.** While a reply streams, the text so far is re-rendered
+  as Markdown in a live region and printed in full when the reply ends. A tool
+  approval prompt cannot appear in the middle of it, because `Agent.ask()` always
+  calls `end_stream` before any tool runs, including after an error or Ctrl+C.
+
+Prompt history is not Rich's job. Importing Python's `readline` module, where it
+exists, makes Up and Down recall earlier prompts in `input()` the way a Bash shell
+does. Windows consoles provide a similar history themselves.
+
+One limitation: Python decides whether the output is a terminal. Some shell windows
+(for example Git Bash under mintty) connect Python through a pipe, so Pieni falls
+back to plain text there; use PowerShell, cmd, or Windows Terminal instead.
+
 ## File permissions: the minimal sandbox
 
 A **sandbox** is a boundary that keeps a program away from everything outside an agreed
@@ -447,6 +487,112 @@ Saved conversations are sensitive: file contents and command output can contain
 credentials. Pieni does not deliberately save its API-key configuration, but it
 does not scrub secrets out of tool output or user messages.
 
+## Skills: instructions loaded on demand
+
+A model knows a lot in general, but not how *your* team deploys, names release
+branches, or writes a changelog. There are three ways to teach it:
+
+- Put the instructions in the system prompt (Pieni does this with `AGENTS.md`). The
+  model always sees them, so they cost context on every request, whether the task
+  needs them or not.
+- Type them into the prompt each time. It works, but nobody remembers to do it, and
+  nobody else can reuse it.
+- Write a **skill**: a named, reusable bundle of instructions that the harness
+  advertises cheaply and the model loads only when it is relevant.
+
+Most agents now support skills, and the format is shared. An [Agent Skills](https://agentskills.io/specification)
+skill is a folder whose `SKILL.md` file starts with a few lines of metadata and then
+holds ordinary Markdown:
+
+```markdown
+---
+name: web-fetch
+description: Download a web page or file with curl or wget and read it. Use when the user gives a URL.
+---
+# Fetch from the web
+1. Download with curl using a browser User-Agent...
+```
+
+The folder may also hold scripts, reference documents, or templates that the
+instructions point to. Because the file format is shared, a skill written for one
+agent usually works in another, and `.agents/skills` is the folder many of them read.
+
+### Progressive disclosure
+
+The key idea is that a skill is loaded in stages, so having fifty skills does not mean
+paying for fifty manuals on every request:
+
+1. **Catalog:** at startup the harness reads only each skill's `name` and
+   `description` and puts one line per skill in the system prompt. This is a few
+   dozen tokens per skill.
+2. **Instructions:** when a task matches a description, the *model* decides to read
+   the full `SKILL.md`. In Pieni this is an ordinary `read` tool call.
+3. **Resources:** the instructions may name more files or scripts, which the model
+   reads or runs only if the task needs them.
+
+Nothing in the harness matches keywords or picks skills. The description is a note
+to the model, so a good one says both what the skill does and *when to use it*
+("Use when the user gives a URL"). A vague description such as "Helps with the web"
+leaves the model guessing, and it may never load the skill.
+
+### Why they are useful
+
+- **Context stays small.** Long procedures cost nothing until they are needed,
+  unlike a large `AGENTS.md`.
+- **Knowledge is reusable and versionable.** A skill is a plain Markdown file in a
+  repository. It can be reviewed, shared with a team, or copied between agents.
+- **Behavior without new code.** Teaching an agent a workflow, such as the correct
+  `curl` flags to get past sites that reject unknown clients, needs no change to the
+  harness and no new tool.
+- **Personal and project scope.** `~/.agents/skills` holds habits you want
+  everywhere; `.agents/skills` in a repository holds that project's rules, and the
+  project version wins when names collide.
+
+Skills are not a replacement for tools or MCP servers. A skill only *tells* the model
+what to do with the tools it already has (`bash`, `read`, ...); it adds no new
+capability. Tools and MCP servers add capabilities, and skills explain how to use them
+well.
+
+### How Pieni does it
+
+The implementation is about fifty lines, all in `pieni.py`:
+
+- `find_skills()` scans `~/.agents/skills/*/SKILL.md`, then the same path in the
+  workspace, one level deep.
+- `read_skill()` is a deliberately small frontmatter reader: it takes `name` and
+  `description` and ignores other keys. It follows the Agent Skills naming rules
+  (lowercase letters, digits, hyphens; name equals folder name; description 1-1024
+  characters) and `find_skills()` warns about and skips any skill that breaks them.
+  There is no YAML library, to avoid a dependency.
+- `build_instructions()` appends the catalog after `AGENTS.md`, with one sentence
+  asking the model to read a matching skill's `SKILL.md` first.
+- `Permissions` lets the `read` tool read inside `~/.agents/skills` without approval.
+  Without that exception, user-level skills sit outside the workspace and would be
+  denied in headless mode. Writing there still needs approval.
+- `/skills` lists what was loaded; skills are read once at startup.
+
+A few consequences are worth knowing:
+
+- **A skill is trusted instructions.** The model is asked to follow it, and it can lead
+  to `bash` commands. A skill from a repository you have just cloned can steer the
+  agent the same way a malicious `AGENTS.md` can, so read third-party skills before
+  using them. Even a trusted skill cannot make `auto` mode safe; the destructive
+  command guard still applies, and it is only a best-effort check.
+- **Activation is the model's choice.** A model can fail to notice that a skill applies,
+  or load one it does not need. If a skill is being ignored, improve its description
+  first, or name the skill in your prompt.
+- **Loaded text is ordinary context.** The catalog lives in the system prompt and
+  survives compaction. The body of a skill read with `read` is a tool result, so
+  `/compact` shortens it like any other tool output.
+- **Content a skill fetches is still untrusted.** The bundled
+  `.agents/skills/web-fetch` example tells the model to treat downloaded pages as
+  data, not as instructions, because web pages can contain text aimed at an agent.
+
+Pieni leaves out what larger agents offer: running skill scripts as a managed step,
+the optional `allowed-tools` field, skills in other folder conventions
+(`.claude/skills`, `.github/skills`), reloading during a session, and
+user-typed skill invocation.
+
 ## Provider adapters
 
 The loop should not need to know whether a provider calls an operation
@@ -567,8 +713,8 @@ For an incompatible API, add one request/reply function with the same contract a
 `call_responses()` or `call_chat_completions()`, wire it into `Provider.complete()`,
 and construct its client in `build_provider()`. Translate message roles, tool
 schemas, call/result IDs, streaming events, usage, and errors. Reuse existing
-dependencies when possible; this project intentionally permits only `openai` and
-`openrouter` as direct external dependencies, so adding another vendor SDK would
+dependencies when possible; this project intentionally permits only `openai`,
+`openrouter`, and `rich` (terminal display only) as direct external dependencies, so adding another vendor SDK would
 be a deliberate change to its scope.
 
 Test a plain reply, one tool call followed by an answer, multiple calls, malformed
@@ -587,13 +733,14 @@ Use function names rather than fixed line numbers, which change as the file does
 | How are tools defined and checked? | `TOOL_SPECS`, `Toolbox.run()`, `Toolbox.validate()` |
 | Where are access decisions made? | `Permissions`, `resolve_path()`, `dcg_reason()` |
 | What does the model receive? | `Agent.wire_messages()`, `build_instructions()`, provider converters |
+| How are skills found and listed? | `find_skills()`, `read_skill()`, `build_instructions()`, `Agent.handle_command()` (`/skills`) |
+| How is output drawn? | `RichUI`, `line_style()`, the `out`/`stream_out`/`answer_out`/`end_stream` hooks in `run_agent()` |
 | What survives restart or compaction? | `Store`, `compaction_history()`, `Agent.compact()` |
 
 `AGENTS.md` is loaded only from the starting workspace root and combined with the
 system prompt. Pieni does not recursively discover nested instruction files.
-Skills (`SKILL.md` folders in `~/.agents/skills` and `.agents/skills`) are added the
-same way, but only as a name/description catalog; the model reads a skill's full
-text with the `read` tool when it decides the task needs it.
+Skills are added to the same prompt as a name/description catalog; see
+[Skills](#skills-instructions-loaded-on-demand).
 Configuration is user INI first, launch-directory INI second, explicit CLI values
 last. Those are harness decisions, not behaviors learned by the model.
 
