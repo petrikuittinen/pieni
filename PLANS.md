@@ -20,6 +20,10 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
 - A short system prompt emphasizing KISS, YAGNI, DRY, and testing changes.
 - Load `AGENTS.md` from the starting workspace root if present. No recursive
   instruction discovery in this version.
+- Skills: `SKILL.md` folders (Agent Skills format) one level under `~/.agents/skills`
+  and `.agents/skills`, project overriding user. Only name, description, and path
+  enter the system prompt; the model loads a skill with `read`, which may read the
+  user skills directory without approval. No scripts runner or other skill fields.
 - Four tools: `read`, `write`, `edit`, and `bash`.
   - `read`: read UTF-8 text, optionally selecting a line range.
   - `write`: create or replace a UTF-8 file.
@@ -171,6 +175,7 @@ Provide a small Bash launcher named `pieni`; tests live in separate Python files
   - `/reasoning`: show effort; `/reasoning EFFORT`: change effort until exit.
     Invalid values or extra arguments leave it unchanged; changes are not saved
     as configuration or session settings.
+  - `/skills`: list the skills found at startup, or say where Pieni looks.
   - `!COMMAND`: run directly in the workspace using the shell tool's permission
     checks, 60-second timeout, decoding, and output bounds. Print stdout/stderr
     and `ok` or an error cause/exit code with elapsed milliseconds. Interruption

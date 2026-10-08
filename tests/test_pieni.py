@@ -294,12 +294,44 @@ class ConfigTests(TempWorkspaceCase):
 
     def test_instructions_include_agents_md(self):
         self.write(self.workspace / "AGENTS.md", "Keep it small.\n")
-        text = pieni.build_instructions(self.workspace)
+        text = pieni.build_instructions(self.workspace, self.home)
         self.assertIn(pieni.SYSTEM_PROMPT, text)
         self.assertIn("Keep it small.", text)
 
     def test_instructions_without_agents_md(self):
-        self.assertEqual(pieni.build_instructions(self.workspace), pieni.SYSTEM_PROMPT)
+        self.assertEqual(pieni.build_instructions(self.workspace, self.home), pieni.SYSTEM_PROMPT)
+
+    def skill(self, root, name, description="Does a thing. Use when asked.", folder=None):
+        return self.write(root / pieni.SKILLS_DIR / (folder or name) / "SKILL.md",
+                          f"---\nname: {name}\ndescription: {description}\n---\n# Body\n")
+
+    def test_instructions_list_user_and_project_skills(self):
+        user = self.skill(self.home, "pdf-tools", "'Fill PDFs: forms'")
+        project = self.skill(self.workspace, "deploy")
+        text = pieni.build_instructions(self.workspace, self.home)
+        self.assertIn(f"- pdf-tools: Fill PDFs: forms ({user})", text)
+        self.assertIn(f"- deploy: Does a thing. Use when asked. ({project})", text)
+        self.assertNotIn("# Body", text)  # only the catalog, not the skill text
+
+    def test_project_skill_overrides_user_skill(self):
+        self.skill(self.home, "deploy", "user version")
+        project = self.skill(self.workspace, "deploy", "project version")
+        text = pieni.build_instructions(self.workspace, self.home)
+        self.assertIn(f"- deploy: project version ({project})", text)
+        self.assertNotIn("user version", text)
+
+    def test_invalid_skills_are_skipped_with_a_warning(self):
+        self.skill(self.workspace, "Bad_Name")
+        self.skill(self.workspace, "other", folder="mismatch")
+        self.skill(self.workspace, "empty", description="")
+        self.write(self.workspace / pieni.SKILLS_DIR / "plain" / "SKILL.md", "# no frontmatter\n")
+        self.skill(self.workspace, "good")
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            text = pieni.build_instructions(self.workspace, self.home)
+        self.assertEqual(text.count("\n- "), 1)
+        self.assertIn("- good:", text)
+        self.assertEqual(stderr.getvalue().count("warning: skipped skill"), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +683,14 @@ class PermissionTests(TempWorkspaceCase):
     def test_absolute_path_inside_the_workspace_is_allowed(self):
         permissions = self.permissions()
         self.assertEqual(permissions.check_file(self.workspace / "a.txt", "read"), (True, ""))
+
+    def test_user_skills_are_readable_but_not_writable(self):
+        skills = self.home / pieni.SKILLS_DIR
+        permissions = pieni.Permissions("auto", self.workspace, tempdir=self.root / "tmp",
+                                        approve=None, skills_root=skills)
+        self.assertEqual(permissions.check_file(skills / "x" / "SKILL.md", "read"), (True, ""))
+        self.assertFalse(permissions.check_file(skills / "x" / "SKILL.md", "write")[0])
+        self.assertFalse(permissions.check_file(self.home / "other.txt", "read")[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1219,18 @@ class AgentCommandTests(TempWorkspaceCase):
         agent, _, _, output = self.make_agent([])
         self.assertTrue(agent.handle_command("/help"))
         self.assertIn("/compact", output[0])
+
+    def test_skills_command_lists_loaded_skills(self):
+        agent, _, _, output = self.make_agent([])
+        agent.handle_command("/skills")
+        self.assertIn("no skills found", output[0])
+        agent.skills = {"deploy": ("Ship it.", Path("x/SKILL.md"))}
+        agent.handle_command("/skills")
+        self.assertEqual(output[1], f"deploy: Ship it. ({Path('x/SKILL.md')})")
+
+    def test_bundled_example_skill_is_valid(self):
+        path = Path(pieni.__file__).parent / pieni.SKILLS_DIR / "web-fetch" / "SKILL.md"
+        self.assertEqual(pieni.read_skill(path)[0], "web-fetch")
 
     def test_permissions_can_be_shown_and_changed(self):
         agent, _, _, output = self.make_agent([])

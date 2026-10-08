@@ -591,6 +591,9 @@ Use function names rather than fixed line numbers, which change as the file does
 
 `AGENTS.md` is loaded only from the starting workspace root and combined with the
 system prompt. Pieni does not recursively discover nested instruction files.
+Skills (`SKILL.md` folders in `~/.agents/skills` and `.agents/skills`) are added the
+same way, but only as a name/description catalog; the model reads a skill's full
+text with the `read` tool when it decides the task needs it.
 Configuration is user INI first, launch-directory INI second, explicit CLI values
 last. Those are harness decisions, not behaviors learned by the model.
 

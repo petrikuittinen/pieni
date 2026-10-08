@@ -42,6 +42,8 @@ REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_details")
 PERMISSIONS = ("auto", "yolo")
 DEFAULT_PERMISSIONS = "auto"
 DB_PATH = Path(APP_DIR) / "pieni.db"
+SKILLS_DIR = Path(".agents") / "skills"  # shared by many agents; under ~ and the workspace
+SKILL_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*$")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 CONTEXT_WINDOW = 1_000_000  # display-only assumption, not a model's real limit
@@ -79,6 +81,7 @@ HELP = f"""commands:
 /compact all    clear the context and start a fresh session
 /permissions    show permissions; /permissions auto|yolo changes them
 /reasoning      show effort; /reasoning EFFORT changes it (default resets it)
+/skills         list the skills loaded at startup
 !COMMAND        run a shell command locally, without adding it to the conversation
 /help           this help
 /quit, /exit    leave
@@ -283,8 +286,41 @@ def provider_kind(provider):
                       f"deepseek, or an http(s) base URL")
 
 
-def build_instructions(workspace):
-    """System prompt plus AGENTS.md from the workspace root, when present."""
+def read_skill(path):
+    """(name, description) from a SKILL.md frontmatter; ValueError when invalid."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    end = next((i for i, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+    if not lines or lines[0].strip() != "---" or end is None:
+        raise ValueError("missing --- frontmatter")
+    fields = {}
+    for line in lines[1:end]:
+        key, colon, value = line.partition(":")
+        if colon and not line[:1].isspace():  # top-level "key: value" only
+            fields[key.strip()] = value.strip().strip("\"'")
+    name, description = fields.get("name", ""), fields.get("description", "")
+    if len(name) > 64 or not SKILL_NAME.match(name) or name != path.parent.name:
+        raise ValueError(f"name '{name}' must be lowercase-with-hyphens and match its folder")
+    if not 1 <= len(description) <= 1024:
+        raise ValueError("description must be 1-1024 characters")
+    return name, description
+
+
+def find_skills(workspace, home):
+    """{name: (description, path)} from ~/.agents/skills, then the workspace, which wins."""
+    skills = {}
+    for root in (Path(home) / SKILLS_DIR, Path(workspace) / SKILLS_DIR):
+        for path in sorted(root.glob("*/SKILL.md")):
+            try:
+                name, description = read_skill(path)
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                print(f"warning: skipped skill {path}: {exc}", file=sys.stderr)
+                continue
+            skills[name] = (description, path)
+    return skills
+
+
+def build_instructions(workspace, home=None, skills=None):
+    """System prompt, AGENTS.md from the workspace root, and a catalog of skills."""
     parts = [SYSTEM_PROMPT]
     path = Path(workspace) / "AGENTS.md"
     if path.is_file():
@@ -294,6 +330,14 @@ def build_instructions(workspace):
             raise ConfigError(f"cannot read {path}: {exc}") from exc
         if text:
             parts.append(f"Project instructions from AGENTS.md:\n{text}")
+    if skills is None:
+        skills = find_skills(workspace, home or os.path.expanduser("~"))
+    if skills:  # only the catalog; the model loads a skill's full text on demand
+        parts.append("Skills: when a task matches a skill's description, read its SKILL.md "
+                     "with the read tool and follow it. Relative paths inside a skill "
+                     "are relative to its directory.\n"
+                     + "\n".join(f"- {name}: {description} ({path})"
+                                 for name, (description, path) in skills.items()))
     return "\n\n".join(parts)
 
 
@@ -468,15 +512,17 @@ def is_inside(path, root):
 class Permissions:
     """Decides whether a tool action may run (see PLANS.md 'Permissions')."""
 
-    def __init__(self, mode, workspace, tempdir=None, approve=None):
+    def __init__(self, mode, workspace, tempdir=None, approve=None, skills_root=None):
         self.mode = mode
         self.workspace = Path(workspace).resolve()
         self.tempdir = Path(tempdir or tempfile.gettempdir()).resolve()
         self.approve = approve  # callable(kind, detail, reason) -> bool, or None
+        self.skills_root = Path(skills_root).resolve() if skills_root else None  # read-only
 
     def check_file(self, resolved, action):
         if (self.mode == "yolo" or is_inside(resolved, self.workspace)
-                or is_inside(resolved, self.tempdir)):
+                or is_inside(resolved, self.tempdir)
+                or (action == "read" and self.skills_root and is_inside(resolved, self.skills_root))):
             return True, ""
         return self.ask("file", f"{action} {resolved}",
                         "the path is outside the workspace and temp directory")
@@ -1170,7 +1216,7 @@ class Agent:
 
     def __init__(self, provider, store, session_id, instructions, messages,
                  workspace, permissions, out=print, dots=None, stream_out=None,
-                 answer_out=None, end_stream=None):
+                 answer_out=None, end_stream=None, skills=None):
         self.provider = provider
         self.store = store
         self.session_id = session_id
@@ -1184,6 +1230,7 @@ class Agent:
                                         if out is print else out(text))
         self.answer_out = answer_out or out  # where a non-streamed model answer goes
         self.end_stream = end_stream or (lambda: None)  # lets a UI close its live view
+        self.skills = skills or {}  # as found at startup: {name: (description, path)}
         self._streamed_text = False
         # None means "decide from the output stream itself"; tests pass a writer.
         self.dots = dot_writer() if dots is None else dots
@@ -1333,6 +1380,10 @@ class Agent:
             return False
         if command == "/help":
             self.out(HELP)
+        elif command == "/skills":
+            self.out("\n".join(f"{name}: {description} ({path})"
+                              for name, (description, path) in self.skills.items())
+                     or f"no skills found in ~/{SKILLS_DIR.as_posix()} or ./{SKILLS_DIR.as_posix()}")
         elif command == "/permissions":
             self.set_permissions(argument)
         elif command == "/reasoning":
@@ -1519,14 +1570,16 @@ def run_agent(arguments):
         say(session_line)
         permissions = Permissions(
             settings["permissions"], workspace,
-            approve=None if arguments.run is not None else cli_approve)
+            approve=None if arguments.run is not None else cli_approve,
+            skills_root=Path(os.path.expanduser("~")) / SKILLS_DIR)
         say(f"permissions: {permissions.mode}")
         if permissions.mode == "yolo":
             say(YOLO_WARNING)
         hooks = ({"out": ui.out, "answer_out": ui.markdown, "stream_out": ui.stream,
                   "end_stream": ui.end} if ui else {})
-        agent = Agent(provider, store, session_id, build_instructions(workspace),
-                      messages, workspace, permissions, **hooks)
+        skills = find_skills(workspace, os.path.expanduser("~"))
+        agent = Agent(provider, store, session_id, build_instructions(workspace, skills=skills),
+                      messages, workspace, permissions, skills=skills, **hooks)
         if arguments.run is not None:
             if not arguments.run.strip():
                 raise ConfigError("-r/--run needs a non-empty prompt")

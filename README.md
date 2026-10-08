@@ -181,6 +181,7 @@ The same list is printed when Pieni is started with no arguments.
 /compact all    clear the context and start a fresh session
 /permissions    show permissions; /permissions auto|yolo changes them
 /reasoning      show effort; /reasoning EFFORT changes it (default resets it)
+/skills         list the skills loaded at startup
 !COMMAND        run a local shell command, without adding it to the conversation
 /help           concise help
 /quit, /exit    leave
@@ -225,6 +226,29 @@ A task gets at most **500 model rounds**. One round may ask for several tool cal
 at once, so this budgets the conversation with the model, not the number of
 individual tool calls. When the rounds run out, Pieni prints the task summary and
 keeps the context, so you can ask it to continue.
+
+## Skills
+
+A skill is a folder with a `SKILL.md` file, in the shared
+[Agent Skills](https://agentskills.io/specification) format. Pieni looks in
+`~/.agents/skills/` and `.agents/skills/` in the workspace; a project skill
+overrides a user skill with the same name.
+
+```markdown
+---
+name: deploy
+description: Deploy the site to staging. Use when the user asks to deploy or release.
+---
+Steps the model should follow...
+```
+
+At startup only each skill's name, description, and path go into the system prompt.
+When a task matches, the model reads the full `SKILL.md` with the `read` tool.
+`name` must be lowercase letters, digits, and hyphens, and match the folder name;
+`description` is 1-1024 characters. Other fields are ignored, and invalid skills
+are skipped with a warning on stderr. Skills are loaded once at startup; `/skills`
+lists them. The repository includes an example, `.agents/skills/web-fetch`, which
+teaches the model to download pages with `curl` or `wget`.
 
 ## Limits
 
@@ -377,5 +401,5 @@ the tests use temporary workspaces.
 ## Not included
 
 Live reasoning streaming, automatic compaction, runtime provider/model switching,
-web search, MCP, skills, plugins, multiple agent modes,
+web search, MCP, plugins, multiple agent modes,
 and a real OS sandbox. See `PLANS.md` for the scope and `AGENTS.md` for the rules.
