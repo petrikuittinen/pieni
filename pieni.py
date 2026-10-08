@@ -63,7 +63,7 @@ MAX_STEPS = 500
 THINK_TRACE_CHARACTERS = 120  # how much of a model thinking trace to display
 THINK_DOT_INTERVAL = 1.0      # print one "." this often while waiting for the model
 PROMPT = "pieni> "
-VERSION = "0.15"
+VERSION = "0.20"
 BANNER = f"Pieni agent v{VERSION} by Petri Kuittinen"
 
 SYSTEM_PROMPT = """You are Pieni, a small coding agent working in a local workspace.

@@ -1,6 +1,6 @@
 # pieni
 
-**v0.15** — written by Petri Kuittinen, 2026.
+**v0.20** — written by Petri Kuittinen, 2026.
 
 A tiny AI coding agent written in Python: one file of about 1900 lines of code
 (`pieni.py`) plus a small Bash launcher (`pieni`). It is meant for learning how
@@ -150,7 +150,7 @@ An interactive session greets you with the version banner and the startup state:
 
 ```console
 ./pieni deepseek -m "deepseek-chat"
-Pieni agent v0.15 by Petri Kuittinen
+Pieni agent v0.20 by Petri Kuittinen
 resumed a session with 6 message(s) (deepseek/deepseek-chat)
 permissions: auto
 Type a task, or /help for commands. Ctrl+C interrupts, Ctrl+D exits.
@@ -367,7 +367,7 @@ Every tunable default is a constant near the top of `pieni.py`:
 | `DEFAULT_STREAMING` | `True` | streaming when neither file nor CLI sets it |
 | `DB_PATH` | `.pieni/pieni.db` | saved conversations, under the workspace |
 | `PROMPT` | `pieni> ` | interactive prompt |
-| `VERSION` | `0.15` | shown in the banner |
+| `VERSION` | `0.20` | shown in the banner |
 
 `MAX_READ_LINES` and `MAX_OUTPUT_CHARS` are independent: a `read` returns at most
 5,000 lines, and whatever a tool produces is cut off at 65,536 characters with a
